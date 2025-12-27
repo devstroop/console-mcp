@@ -11,15 +11,31 @@ import { spawn, execSync } from "child_process";
 // Store active log streams
 const activeStreams: Map<string, ReturnType<typeof spawn>> = new Map();
 
+// Device/Simulator types
+interface Device {
+  udid: string;
+  name: string;
+  model: string;
+  connectionType?: string;
+}
+
+interface Simulator {
+  udid: string;
+  name: string;
+  state: string;
+  runtime: string;
+  isAvailable: boolean;
+}
+
 // Get list of connected iOS devices
-function getConnectedDevices(): Array<{ udid: string; name: string; model: string }> {
+function getConnectedDevices(): Device[] {
   try {
     const output = execSync("xcrun devicectl list devices 2>/dev/null", {
       encoding: "utf-8",
       timeout: 10000,
     });
     
-    const devices: Array<{ udid: string; name: string; model: string }> = [];
+    const devices: Device[] = [];
     const lines = output.split("\n").slice(2); // Skip header lines
     
     for (const line of lines) {
@@ -29,6 +45,7 @@ function getConnectedDevices(): Array<{ udid: string; name: string; model: strin
           name: parts[0],
           udid: parts[2],
           model: parts[4] || "Unknown",
+          connectionType: parts[1] || "Unknown",
         });
       }
     }
@@ -38,7 +55,53 @@ function getConnectedDevices(): Array<{ udid: string; name: string; model: strin
   }
 }
 
-// Get iOS device logs using devicectl
+// Get list of iOS Simulators
+function getSimulators(): Simulator[] {
+  try {
+    const output = execSync("xcrun simctl list devices -j", {
+      encoding: "utf-8",
+      timeout: 10000,
+    });
+    
+    const data = JSON.parse(output);
+    const simulators: Simulator[] = [];
+    
+    for (const [runtime, devices] of Object.entries(data.devices)) {
+      const runtimeName = runtime.replace("com.apple.CoreSimulator.SimRuntime.", "").replace(/-/g, " ");
+      for (const device of devices as Array<{ udid: string; name: string; state: string; isAvailable: boolean }>) {
+        simulators.push({
+          udid: device.udid,
+          name: device.name,
+          state: device.state,
+          runtime: runtimeName,
+          isAvailable: device.isAvailable,
+        });
+      }
+    }
+    
+    return simulators;
+  } catch {
+    return [];
+  }
+}
+
+// Find simulator by name or UDID
+function findSimulator(identifier: string): Simulator | undefined {
+  const simulators = getSimulators();
+  return simulators.find(
+    (s) => s.udid === identifier || s.name.toLowerCase() === identifier.toLowerCase()
+  );
+}
+
+// Find device by name or UDID
+function findDevice(identifier: string): Device | undefined {
+  const devices = getConnectedDevices();
+  return devices.find(
+    (d) => d.udid === identifier || d.name.toLowerCase() === identifier.toLowerCase()
+  );
+}
+
+// Get iOS device logs using idevicesyslog or devicectl
 async function getDeviceLogs(
   udid: string,
   process?: string,
@@ -46,39 +109,31 @@ async function getDeviceLogs(
   maxLines: number = 200
 ): Promise<string> {
   return new Promise((resolve) => {
+    let output = "";
+    let lineCount = 0;
+    
+    // Check if idevicesyslog is available (preferred for real-time)
+    let hasIdevicesyslog = false;
     try {
-      // Use log show with predicate for iOS device
-      // Note: This requires the device to be paired and connected
-      const args = [
-        "devicectl",
-        "device",
-        "process",
-        "getlog",
-        "--device",
-        udid,
-      ];
-      
-      // Fallback: use simctl for simulators or idevicesyslog
-      // For real devices, we'll use a different approach
-      
-      // Try using `log` command which can access device logs if device is connected
-      const logArgs = ["show", "--last", `${lastMinutes}m`, "--style", "compact"];
-      
+      execSync("which idevicesyslog", { encoding: "utf-8" });
+      hasIdevicesyslog = true;
+    } catch {
+      hasIdevicesyslog = false;
+    }
+    
+    if (hasIdevicesyslog) {
+      // Use idevicesyslog for real device logs
+      const args = ["-u", udid];
       if (process) {
-        logArgs.push("--predicate", `processImagePath CONTAINS "${process}"`);
+        args.push("-m", process); // Match process name
       }
       
-      const child = spawn("log", logArgs, {
-        timeout: 30000,
-      });
-      
-      let output = "";
-      let lineCount = 0;
+      const child = spawn("idevicesyslog", args);
       
       child.stdout.on("data", (data: Buffer) => {
         const lines = data.toString().split("\n");
         for (const line of lines) {
-          if (lineCount < maxLines) {
+          if (lineCount < maxLines && line.trim()) {
             output += line + "\n";
             lineCount++;
           }
@@ -86,26 +141,166 @@ async function getDeviceLogs(
       });
       
       child.stderr.on("data", (data: Buffer) => {
-        output += `[stderr] ${data.toString()}`;
+        const errMsg = data.toString();
+        if (!errMsg.includes("waiting")) {
+          output += `[stderr] ${errMsg}`;
+        }
       });
       
-      child.on("close", () => {
-        resolve(output || "No logs found");
-      });
+      // Collect for a short duration since idevicesyslog is real-time
+      const collectDuration = Math.min(lastMinutes * 1000, 10000); // Max 10 seconds
+      setTimeout(() => {
+        child.kill("SIGTERM");
+        resolve(output || `No logs captured from device ${udid}`);
+      }, collectDuration);
       
       child.on("error", (err) => {
-        resolve(`Error: ${err.message}`);
+        resolve(`Error: ${err.message}\n\nMake sure the device is connected and trusted.`);
       });
-      
-      // Timeout after 10 seconds
-      setTimeout(() => {
-        child.kill();
-        resolve(output || "Timeout waiting for logs");
-      }, 10000);
-      
-    } catch (err) {
-      resolve(`Error: ${err}`);
+    } else {
+      // Fallback message - suggest installing libimobiledevice
+      resolve(
+        `⚠️ idevicesyslog not found.\n\n` +
+        `To get iOS device logs, install libimobiledevice:\n` +
+        `  brew install libimobiledevice\n\n` +
+        `Then ensure your device is:\n` +
+        `  1. Connected via USB\n` +
+        `  2. Unlocked\n` +
+        `  3. Trusted (tap "Trust" on device when prompted)`
+      );
     }
+  });
+}
+
+// Get iOS Simulator logs
+async function getSimulatorLogs(
+  udid: string,
+  process?: string,
+  lastMinutes: number = 5,
+  maxLines: number = 200
+): Promise<string> {
+  return new Promise((resolve) => {
+    // Simulator logs are in ~/Library/Logs/CoreSimulator/{UDID}/system.log
+    // But we can also use `xcrun simctl spawn` to run log command inside simulator
+    
+    // First, check if simulator is booted
+    const simulator = findSimulator(udid);
+    if (!simulator) {
+      resolve(`Simulator with identifier "${udid}" not found`);
+      return;
+    }
+    
+    if (simulator.state !== "Booted") {
+      resolve(
+        `Simulator "${simulator.name}" is not running (state: ${simulator.state}).\n` +
+        `Boot it first with: xcrun simctl boot "${simulator.udid}"`
+      );
+      return;
+    }
+    
+    // Use log command with simulator predicate
+    const args = [
+      "show",
+      "--last", `${lastMinutes}m`,
+      "--style", "compact",
+      "--predicate", `subsystem CONTAINS "com.apple" AND simulatorIdentifier == "${udid}"`
+    ];
+    
+    // Alternative: Use xcrun simctl spawn to run log inside simulator
+    const spawnArgs = [
+      "simctl", "spawn", udid,
+      "log", "show",
+      "--last", `${lastMinutes}m`,
+      "--style", "compact"
+    ];
+    
+    if (process) {
+      spawnArgs.push("--predicate", `processImagePath CONTAINS "${process}"`);
+    }
+    
+    const child = spawn("xcrun", spawnArgs);
+    let output = "";
+    let lineCount = 0;
+    
+    child.stdout.on("data", (data: Buffer) => {
+      const lines = data.toString().split("\n");
+      for (const line of lines) {
+        if (lineCount < maxLines) {
+          output += line + "\n";
+          lineCount++;
+        }
+      }
+    });
+    
+    child.stderr.on("data", (data: Buffer) => {
+      output += `[stderr] ${data.toString()}`;
+    });
+    
+    child.on("close", () => {
+      resolve(output || `No logs found for simulator ${simulator.name}`);
+    });
+    
+    child.on("error", (err) => {
+      resolve(`Error: ${err.message}`);
+    });
+    
+    setTimeout(() => {
+      child.kill();
+      resolve(output || "Timeout waiting for simulator logs");
+    }, 15000);
+  });
+}
+
+// Stream simulator logs in real-time
+async function streamSimulatorLogs(
+  udid: string,
+  process?: string,
+  durationSeconds: number = 10
+): Promise<string> {
+  return new Promise((resolve) => {
+    const simulator = findSimulator(udid);
+    if (!simulator) {
+      resolve(`Simulator with identifier "${udid}" not found`);
+      return;
+    }
+    
+    if (simulator.state !== "Booted") {
+      resolve(
+        `Simulator "${simulator.name}" is not running.\n` +
+        `Boot it first with: xcrun simctl boot "${simulator.udid}"`
+      );
+      return;
+    }
+    
+    const spawnArgs = [
+      "simctl", "spawn", udid,
+      "log", "stream",
+      "--style", "compact"
+    ];
+    
+    if (process) {
+      spawnArgs.push("--predicate", `processImagePath CONTAINS "${process}"`);
+    }
+    
+    const child = spawn("xcrun", spawnArgs);
+    let output = "";
+    
+    child.stdout.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    
+    child.stderr.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    
+    setTimeout(() => {
+      child.kill("SIGTERM");
+      resolve(output || `No logs captured from simulator ${simulator.name}`);
+    }, durationSeconds * 1000);
+    
+    child.on("error", (err) => {
+      resolve(`Error: ${err.message}`);
+    });
   });
 }
 
@@ -272,7 +467,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "list_devices",
-        description: "List connected iOS devices",
+        description: "List connected iOS devices (physical devices connected via USB)",
         inputSchema: {
           type: "object",
           properties: {},
@@ -280,8 +475,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "list_simulators",
+        description: "List available iOS Simulators with their state (Booted/Shutdown)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            onlyBooted: {
+              type: "boolean",
+              description: "Only show running simulators (default: false)",
+            },
+            runtime: {
+              type: "string",
+              description: "Filter by runtime (e.g., 'iOS 17', 'iOS 18')",
+            },
+          },
+          required: [],
+        },
+      },
+      {
         name: "get_logs",
-        description: "Get recent logs from macOS or connected iOS device. Use for debugging apps.",
+        description: "Get recent logs from macOS system. Use for debugging macOS apps.",
         inputSchema: {
           type: "object",
           properties: {
@@ -306,6 +519,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "get_device_logs",
+        description: "Get logs from a connected iOS device. Requires libimobiledevice (brew install libimobiledevice)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            device: {
+              type: "string",
+              description: "Device name or UDID (use list_devices to find)",
+            },
+            process: {
+              type: "string",
+              description: "Filter by process/app name",
+            },
+            lastMinutes: {
+              type: "number",
+              description: "How many minutes of logs to capture (default: 5, max: 10)",
+            },
+            maxLines: {
+              type: "number",
+              description: "Maximum log lines (default: 200)",
+            },
+          },
+          required: ["device"],
+        },
+      },
+      {
+        name: "get_simulator_logs",
+        description: "Get logs from an iOS Simulator. The simulator must be booted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            simulator: {
+              type: "string",
+              description: "Simulator name or UDID (use list_simulators to find)",
+            },
+            process: {
+              type: "string",
+              description: "Filter by process/app name",
+            },
+            lastMinutes: {
+              type: "number",
+              description: "How many minutes of logs to fetch (default: 5)",
+            },
+            maxLines: {
+              type: "number",
+              description: "Maximum log lines (default: 200)",
+            },
+          },
+          required: ["simulator"],
+        },
+      },
+      {
         name: "stream_logs",
         description: "Stream live logs for a specified duration. Useful for capturing logs during an action.",
         inputSchema: {
@@ -321,6 +586,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: [],
+        },
+      },
+      {
+        name: "stream_simulator_logs",
+        description: "Stream live logs from an iOS Simulator for a duration",
+        inputSchema: {
+          type: "object",
+          properties: {
+            simulator: {
+              type: "string",
+              description: "Simulator name or UDID",
+            },
+            process: {
+              type: "string",
+              description: "Filter by process name",
+            },
+            durationSeconds: {
+              type: "number",
+              description: "How long to stream (default: 10, max: 30)",
+            },
+          },
+          required: ["simulator"],
         },
       },
       {
@@ -377,14 +664,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const devices = getConnectedDevices();
         if (devices.length === 0) {
           return {
-            content: [{ type: "text", text: "No iOS devices connected" }],
+            content: [{ type: "text", text: "No iOS devices connected.\n\nMake sure your device is:\n1. Connected via USB\n2. Unlocked\n3. Trusted (tap 'Trust' when prompted)" }],
           };
         }
         const deviceList = devices
-          .map((d) => `📱 ${d.name}\n   UDID: ${d.udid}\n   Model: ${d.model}`)
+          .map((d) => `📱 ${d.name}\n   UDID: ${d.udid}\n   Model: ${d.model}\n   Connection: ${d.connectionType}`)
           .join("\n\n");
         return {
-          content: [{ type: "text", text: deviceList }],
+          content: [{ type: "text", text: `Found ${devices.length} device(s):\n\n${deviceList}` }],
+        };
+      }
+      
+      case "list_simulators": {
+        const onlyBooted = args?.onlyBooted as boolean | undefined;
+        const runtimeFilter = args?.runtime as string | undefined;
+        
+        let simulators = getSimulators();
+        
+        if (simulators.length === 0) {
+          return {
+            content: [{ type: "text", text: "No simulators found. Make sure Xcode is installed." }],
+          };
+        }
+        
+        // Filter by booted state
+        if (onlyBooted) {
+          simulators = simulators.filter((s) => s.state === "Booted");
+        }
+        
+        // Filter by runtime
+        if (runtimeFilter) {
+          simulators = simulators.filter((s) => 
+            s.runtime.toLowerCase().includes(runtimeFilter.toLowerCase())
+          );
+        }
+        
+        if (simulators.length === 0) {
+          return {
+            content: [{ type: "text", text: "No simulators match the filter criteria." }],
+          };
+        }
+        
+        const simList = simulators
+          .map((s) => {
+            const status = s.state === "Booted" ? "🟢" : "⚪";
+            return `${status} ${s.name} (${s.runtime})\n   UDID: ${s.udid}\n   State: ${s.state}`;
+          })
+          .join("\n\n");
+        
+        return {
+          content: [{ type: "text", text: `Found ${simulators.length} simulator(s):\n\n${simList}` }],
         };
       }
       
@@ -400,11 +729,96 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
       
+      case "get_device_logs": {
+        const deviceId = args?.device as string;
+        const process = args?.process as string | undefined;
+        const lastMinutes = Math.min((args?.lastMinutes as number) || 5, 10);
+        const maxLines = (args?.maxLines as number) || 200;
+        
+        if (!deviceId) {
+          return {
+            content: [{ type: "text", text: "Error: device parameter is required. Use list_devices to find device name or UDID." }],
+          };
+        }
+        
+        const device = findDevice(deviceId);
+        if (!device) {
+          const devices = getConnectedDevices();
+          if (devices.length === 0) {
+            return {
+              content: [{ type: "text", text: `Device "${deviceId}" not found. No devices are currently connected.` }],
+            };
+          }
+          return {
+            content: [{ 
+              type: "text", 
+              text: `Device "${deviceId}" not found.\n\nAvailable devices:\n${devices.map(d => `- ${d.name} (${d.udid})`).join("\n")}` 
+            }],
+          };
+        }
+        
+        const logs = await getDeviceLogs(device.udid, process, lastMinutes, maxLines);
+        return {
+          content: [{ type: "text", text: `📱 Logs from ${device.name}:\n\n${logs}` }],
+        };
+      }
+      
+      case "get_simulator_logs": {
+        const simulatorId = args?.simulator as string;
+        const process = args?.process as string | undefined;
+        const lastMinutes = (args?.lastMinutes as number) || 5;
+        const maxLines = (args?.maxLines as number) || 200;
+        
+        if (!simulatorId) {
+          return {
+            content: [{ type: "text", text: "Error: simulator parameter is required. Use list_simulators to find simulator name or UDID." }],
+          };
+        }
+        
+        const simulator = findSimulator(simulatorId);
+        if (!simulator) {
+          const bootedSims = getSimulators().filter(s => s.state === "Booted");
+          if (bootedSims.length === 0) {
+            return {
+              content: [{ type: "text", text: `Simulator "${simulatorId}" not found. No simulators are currently running.` }],
+            };
+          }
+          return {
+            content: [{ 
+              type: "text", 
+              text: `Simulator "${simulatorId}" not found.\n\nRunning simulators:\n${bootedSims.map(s => `- ${s.name} (${s.udid})`).join("\n")}` 
+            }],
+          };
+        }
+        
+        const logs = await getSimulatorLogs(simulator.udid, process, lastMinutes, maxLines);
+        return {
+          content: [{ type: "text", text: `📱 Logs from ${simulator.name} (${simulator.runtime}):\n\n${logs}` }],
+        };
+      }
+      
       case "stream_logs": {
         const process = args?.process as string | undefined;
         const duration = Math.min((args?.durationSeconds as number) || 10, 30);
         
         const logs = await streamDeviceLogs("", process, duration);
+        return {
+          content: [{ type: "text", text: logs }],
+        };
+      }
+      
+      case "stream_simulator_logs": {
+        const simulatorId = args?.simulator as string;
+        const process = args?.process as string | undefined;
+        const duration = Math.min((args?.durationSeconds as number) || 10, 30);
+        
+        if (!simulatorId) {
+          return {
+            content: [{ type: "text", text: "Error: simulator parameter is required." }],
+          };
+        }
+        
+        const logs = await streamSimulatorLogs(simulatorId, process, duration);
         return {
           content: [{ type: "text", text: logs }],
         };
