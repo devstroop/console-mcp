@@ -9,8 +9,12 @@ An MCP (Model Context Protocol) server for accessing macOS and iOS device logs d
 - **Get Logs** - Fetch recent logs filtered by process or subsystem
 - **Get Device Logs** - Fetch logs from connected iOS devices
 - **Get Simulator Logs** - Fetch logs from iOS Simulators
+- **Get Logs by Level** - Filter logs by severity (fault, error, warning, info, debug)
 - **Stream Logs** - Capture live logs for a specified duration
-- **Search Logs** - Search through historical logs for specific strings
+- **Search Logs** - Search through historical logs (supports regex)
+- **Get Crash Logs** - List and read crash reports
+- **Watch for Pattern** - Stream until a pattern matches
+- **Export Logs** - Save logs to file for sharing
 - **VPN Logs** - Quick shortcut to get WorxVPN-specific logs
 
 ## Installation
@@ -67,6 +71,16 @@ Get recent logs from macOS.
 | `lastMinutes` | number | Minutes of logs to fetch (default: 5) |
 | `maxLines` | number | Max lines to return (default: 200) |
 
+### `get_logs_by_level`
+Get logs filtered by severity level.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `level` | string | Log level: fault, error, warning, info, debug (required) |
+| `process` | string | Filter by process name |
+| `lastMinutes` | number | Minutes of logs to fetch (default: 5) |
+| `maxLines` | number | Max lines to return (default: 200) |
+
 ### `get_device_logs`
 Get logs from a connected iOS device. Requires `libimobiledevice`.
 
@@ -105,13 +119,49 @@ Stream live logs from an iOS Simulator.
 | `durationSeconds` | number | How long to stream (default: 10, max: 30) |
 
 ### `search_logs`
-Search through recent logs.
+Search through recent logs with text or regex.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `query` | string | Text to search for (case-insensitive) |
+| `query` | string | Text or regex pattern to search for (required) |
+| `useRegex` | boolean | Treat query as regex (default: false) |
 | `lastMinutes` | number | Minutes to search (default: 30) |
 | `maxLines` | number | Max matching lines (default: 100) |
+
+### `get_crash_logs`
+List recent crash reports from DiagnosticReports.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `process` | string | Filter by process/app name |
+| `lastDays` | number | Days to search back (default: 7) |
+| `maxReports` | number | Max reports to list (default: 10) |
+
+### `read_crash_report`
+Read the full content of a specific crash report.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filename` | string | Crash report filename (required) |
+
+### `watch_for_pattern`
+Stream logs until a pattern matches. Great for test automation.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `pattern` | string | Text or regex to watch for (required) |
+| `useRegex` | boolean | Treat pattern as regex (default: false) |
+| `process` | string | Filter by process name |
+| `timeoutSeconds` | number | Max wait time (default: 30, max: 60) |
+
+### `export_logs`
+Export logs to a file on the Desktop.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `logs` | string | Log content to export (required) |
+| `filename` | string | Optional filename |
+| `format` | string | Export format: txt or json (default: txt) |
 
 ### `get_vpn_logs`
 Shortcut to get WorxVPN extension logs.
@@ -129,7 +179,12 @@ Shortcut to get WorxVPN extension logs.
 "Get logs from iPhone 15 Pro simulator"
 "Show device logs from my iPhone"
 "Get the last 5 minutes of Safari logs"
-"Search logs for 'error' in the last hour"
+"Show me all error logs from the last 10 minutes"
+"Search logs for 'authentication' using regex"
+"Get crash logs for MyApp"
+"Read the crash report MyApp-2024-12-27.crash"
+"Watch for 'connection established' while I connect"
+"Export these logs to a file"
 "Stream logs for 15 seconds while I reproduce the bug"
 "Show me WorxVPN logs"
 ```
@@ -147,6 +202,8 @@ Shortcut to get WorxVPN extension logs.
 - `xcrun simctl` is used for simulator logs
 - `idevicesyslog` from libimobiledevice is used for iOS device logs
 - iOS device must be paired and trusted for log access
+- Crash reports are found in `~/Library/Logs/DiagnosticReports`
+- Exported logs are saved to `~/Desktop/ConsoleMCP-Exports/`
 
 ## License
 

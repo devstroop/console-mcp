@@ -7,6 +7,21 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn, execSync } from "child_process";
+import { readdir, readFile, stat, writeFile, mkdir } from "fs/promises";
+import { homedir } from "os";
+import { join, basename } from "path";
+
+// Log level types
+type LogLevel = "fault" | "error" | "warning" | "info" | "debug" | "default";
+
+// Crash report interface
+interface CrashReport {
+  filename: string;
+  path: string;
+  process: string;
+  date: Date;
+  preview: string;
+}
 
 // Store active log streams
 const activeStreams: Map<string, ReturnType<typeof spawn>> = new Map();
@@ -413,7 +428,8 @@ async function streamDeviceLogs(
 async function searchLogs(
   query: string,
   lastMinutes: number = 30,
-  maxLines: number = 100
+  maxLines: number = 100,
+  useRegex: boolean = false
 ): Promise<string> {
   return new Promise((resolve) => {
     const args = ["show", "--last", `${lastMinutes}m`, "--style", "compact"];
@@ -421,12 +437,25 @@ async function searchLogs(
     const child = spawn("log", args);
     let output = "";
     let lineCount = 0;
-    const queryLower = query.toLowerCase();
+    
+    let matcher: (line: string) => boolean;
+    if (useRegex) {
+      try {
+        const regex = new RegExp(query, "i");
+        matcher = (line: string) => regex.test(line);
+      } catch (e) {
+        resolve(`Invalid regex pattern: ${query}\nError: ${e}`);
+        return;
+      }
+    } else {
+      const queryLower = query.toLowerCase();
+      matcher = (line: string) => line.toLowerCase().includes(queryLower);
+    }
     
     child.stdout.on("data", (data: Buffer) => {
       const lines = data.toString().split("\n");
       for (const line of lines) {
-        if (line.toLowerCase().includes(queryLower) && lineCount < maxLines) {
+        if (matcher(line) && lineCount < maxLines) {
           output += line + "\n";
           lineCount++;
         }
@@ -448,11 +477,289 @@ async function searchLogs(
   });
 }
 
+// Get logs filtered by level
+async function getLogsByLevel(
+  level: LogLevel,
+  process?: string,
+  lastMinutes: number = 5,
+  maxLines: number = 200
+): Promise<string> {
+  return new Promise((resolve) => {
+    const args = ["show", "--last", `${lastMinutes}m`, "--style", "compact"];
+    
+    const predicates: string[] = [];
+    
+    // Map log level to predicate
+    // macOS log levels: fault (0), error (1), default (2), info (3), debug (4)
+    switch (level) {
+      case "fault":
+        predicates.push("messageType == fault");
+        break;
+      case "error":
+        predicates.push("(messageType == error OR messageType == fault)");
+        break;
+      case "warning":
+        // Warning maps to default level with certain keywords
+        predicates.push("messageType == default");
+        break;
+      case "info":
+        predicates.push("messageType == info");
+        break;
+      case "debug":
+        predicates.push("messageType == debug");
+        args.push("--info", "--debug"); // Enable info and debug levels
+        break;
+      default:
+        predicates.push("messageType == default");
+    }
+    
+    if (process) {
+      predicates.push(`processImagePath CONTAINS "${process}"`);
+    }
+    
+    if (predicates.length > 0) {
+      args.push("--predicate", predicates.join(" AND "));
+    }
+    
+    const child = spawn("log", args);
+    let output = "";
+    let lineCount = 0;
+    
+    child.stdout.on("data", (data: Buffer) => {
+      const lines = data.toString().split("\n");
+      for (const line of lines) {
+        if (lineCount < maxLines) {
+          output += line + "\n";
+          lineCount++;
+        }
+      }
+    });
+    
+    child.stderr.on("data", (data: Buffer) => {
+      // Ignore stderr for level filtering
+    });
+    
+    child.on("close", () => {
+      resolve(output || `No ${level} logs found`);
+    });
+    
+    child.on("error", (err) => {
+      resolve(`Error: ${err.message}`);
+    });
+    
+    setTimeout(() => {
+      child.kill();
+      resolve(output || "Timeout");
+    }, 15000);
+  });
+}
+
+// Get crash logs from DiagnosticReports
+async function getCrashLogs(
+  process?: string,
+  lastDays: number = 7,
+  maxReports: number = 10
+): Promise<{ reports: CrashReport[]; summary: string }> {
+  const crashDirs = [
+    join(homedir(), "Library/Logs/DiagnosticReports"),
+    "/Library/Logs/DiagnosticReports",
+  ];
+  
+  const reports: CrashReport[] = [];
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - lastDays);
+  
+  for (const dir of crashDirs) {
+    try {
+      const files = await readdir(dir);
+      
+      for (const file of files) {
+        // Crash reports have extensions like .crash, .ips, .diag
+        if (!file.match(/\.(crash|ips|diag)$/)) continue;
+        
+        // Filter by process name if specified
+        if (process && !file.toLowerCase().includes(process.toLowerCase())) {
+          continue;
+        }
+        
+        const filePath = join(dir, file);
+        const fileStat = await stat(filePath);
+        
+        // Check if within date range
+        if (fileStat.mtime < cutoffDate) continue;
+        
+        // Read first few lines for preview
+        const content = await readFile(filePath, "utf-8");
+        const lines = content.split("\n").slice(0, 10);
+        const preview = lines.join("\n");
+        
+        // Extract process name from filename (format: ProcessName-Date-Device.crash)
+        const processName = file.split("-")[0] || file;
+        
+        reports.push({
+          filename: file,
+          path: filePath,
+          process: processName,
+          date: fileStat.mtime,
+          preview,
+        });
+      }
+    } catch {
+      // Directory doesn't exist or not accessible
+      continue;
+    }
+  }
+  
+  // Sort by date descending
+  reports.sort((a, b) => b.date.getTime() - a.date.getTime());
+  
+  // Limit results
+  const limitedReports = reports.slice(0, maxReports);
+  
+  // Create summary
+  let summary = "";
+  if (limitedReports.length === 0) {
+    summary = process 
+      ? `No crash reports found for "${process}" in the last ${lastDays} days.`
+      : `No crash reports found in the last ${lastDays} days.`;
+  } else {
+    summary = `Found ${reports.length} crash report(s)${reports.length > maxReports ? ` (showing ${maxReports})` : ""}:\n\n`;
+    summary += limitedReports.map((r, i) => 
+      `${i + 1}. 💥 ${r.process}\n   File: ${r.filename}\n   Date: ${r.date.toLocaleString()}`
+    ).join("\n\n");
+  }
+  
+  return { reports: limitedReports, summary };
+}
+
+// Read a specific crash report
+async function readCrashReport(filename: string): Promise<string> {
+  const crashDirs = [
+    join(homedir(), "Library/Logs/DiagnosticReports"),
+    "/Library/Logs/DiagnosticReports",
+  ];
+  
+  for (const dir of crashDirs) {
+    try {
+      const filePath = join(dir, filename);
+      const content = await readFile(filePath, "utf-8");
+      return content;
+    } catch {
+      continue;
+    }
+  }
+  
+  return `Crash report "${filename}" not found.`;
+}
+
+// Watch for a pattern and stop when found
+async function watchForPattern(
+  pattern: string,
+  useRegex: boolean = false,
+  process?: string,
+  timeoutSeconds: number = 30
+): Promise<{ found: boolean; matchedLine: string; allOutput: string }> {
+  return new Promise((resolve) => {
+    const args = ["stream", "--style", "compact"];
+    
+    if (process) {
+      args.push("--predicate", `processImagePath CONTAINS "${process}"`);
+    }
+    
+    const child = spawn("log", args);
+    let output = "";
+    let found = false;
+    let matchedLine = "";
+    
+    let matcher: (line: string) => boolean;
+    if (useRegex) {
+      try {
+        const regex = new RegExp(pattern, "i");
+        matcher = (line: string) => regex.test(line);
+      } catch (e) {
+        resolve({ found: false, matchedLine: "", allOutput: `Invalid regex: ${e}` });
+        return;
+      }
+    } else {
+      const patternLower = pattern.toLowerCase();
+      matcher = (line: string) => line.toLowerCase().includes(patternLower);
+    }
+    
+    child.stdout.on("data", (data: Buffer) => {
+      const lines = data.toString().split("\n");
+      for (const line of lines) {
+        output += line + "\n";
+        if (!found && matcher(line)) {
+          found = true;
+          matchedLine = line;
+          child.kill("SIGTERM");
+        }
+      }
+    });
+    
+    child.stderr.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    
+    child.on("close", () => {
+      resolve({ found, matchedLine, allOutput: output });
+    });
+    
+    child.on("error", (err) => {
+      resolve({ found: false, matchedLine: "", allOutput: `Error: ${err.message}` });
+    });
+    
+    // Timeout
+    setTimeout(() => {
+      if (!found) {
+        child.kill("SIGTERM");
+        resolve({ found: false, matchedLine: "", allOutput: output + "\n\n⏱️ Timeout reached without finding pattern." });
+      }
+    }, timeoutSeconds * 1000);
+  });
+}
+
+// Export logs to file
+async function exportLogs(
+  logs: string,
+  filename?: string,
+  format: "txt" | "json" = "txt"
+): Promise<string> {
+  const exportDir = join(homedir(), "Desktop", "ConsoleMCP-Exports");
+  
+  try {
+    await mkdir(exportDir, { recursive: true });
+  } catch {
+    // Directory might already exist
+  }
+  
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const defaultFilename = `logs-${timestamp}.${format}`;
+  const finalFilename = filename || defaultFilename;
+  const filePath = join(exportDir, finalFilename);
+  
+  let content: string;
+  if (format === "json") {
+    const lines = logs.split("\n").filter(l => l.trim());
+    content = JSON.stringify({ 
+      exportedAt: new Date().toISOString(),
+      lineCount: lines.length,
+      logs: lines 
+    }, null, 2);
+  } else {
+    content = `# Console MCP Log Export\n# Exported: ${new Date().toISOString()}\n\n${logs}`;
+  }
+  
+  await writeFile(filePath, content, "utf-8");
+  
+  return filePath;
+}
+
 // Create the MCP server
 const server = new Server(
   {
     name: "console-mcp",
-    version: "1.0.0",
+    version: "1.2.0",
   },
   {
     capabilities: {
@@ -612,13 +919,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_logs",
-        description: "Search through recent logs for a specific string or pattern",
+        description: "Search through recent logs for a specific string or regex pattern",
         inputSchema: {
           type: "object",
           properties: {
             query: {
               type: "string",
-              description: "Text to search for in logs (case-insensitive)",
+              description: "Text or regex pattern to search for in logs",
+            },
+            useRegex: {
+              type: "boolean",
+              description: "Treat query as a regex pattern (default: false)",
             },
             lastMinutes: {
               type: "number",
@@ -630,6 +941,118 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["query"],
+        },
+      },
+      {
+        name: "get_logs_by_level",
+        description: "Get logs filtered by severity level (fault, error, warning, info, debug)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            level: {
+              type: "string",
+              enum: ["fault", "error", "warning", "info", "debug"],
+              description: "Log level to filter by",
+            },
+            process: {
+              type: "string",
+              description: "Filter by process name",
+            },
+            lastMinutes: {
+              type: "number",
+              description: "How many minutes of logs to fetch (default: 5)",
+            },
+            maxLines: {
+              type: "number",
+              description: "Maximum log lines (default: 200)",
+            },
+          },
+          required: ["level"],
+        },
+      },
+      {
+        name: "get_crash_logs",
+        description: "List recent crash reports from DiagnosticReports",
+        inputSchema: {
+          type: "object",
+          properties: {
+            process: {
+              type: "string",
+              description: "Filter by process/app name",
+            },
+            lastDays: {
+              type: "number",
+              description: "How many days back to search (default: 7)",
+            },
+            maxReports: {
+              type: "number",
+              description: "Maximum reports to list (default: 10)",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "read_crash_report",
+        description: "Read the full content of a specific crash report",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filename: {
+              type: "string",
+              description: "The crash report filename (from get_crash_logs)",
+            },
+          },
+          required: ["filename"],
+        },
+      },
+      {
+        name: "watch_for_pattern",
+        description: "Stream logs until a pattern is found. Useful for test automation - start an action, then wait for a specific log message.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pattern: {
+              type: "string",
+              description: "Text or regex pattern to watch for",
+            },
+            useRegex: {
+              type: "boolean",
+              description: "Treat pattern as regex (default: false)",
+            },
+            process: {
+              type: "string",
+              description: "Filter by process name",
+            },
+            timeoutSeconds: {
+              type: "number",
+              description: "Max seconds to wait (default: 30, max: 60)",
+            },
+          },
+          required: ["pattern"],
+        },
+      },
+      {
+        name: "export_logs",
+        description: "Export logs to a file on the Desktop for sharing",
+        inputSchema: {
+          type: "object",
+          properties: {
+            logs: {
+              type: "string",
+              description: "The log content to export (from a previous get_logs call)",
+            },
+            filename: {
+              type: "string",
+              description: "Optional filename (auto-generated if not provided)",
+            },
+            format: {
+              type: "string",
+              enum: ["txt", "json"],
+              description: "Export format (default: txt)",
+            },
+          },
+          required: ["logs"],
         },
       },
       {
@@ -826,6 +1249,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       case "search_logs": {
         const query = args?.query as string;
+        const useRegex = args?.useRegex as boolean || false;
         const lastMinutes = (args?.lastMinutes as number) || 30;
         const maxLines = (args?.maxLines as number) || 100;
         
@@ -835,9 +1259,101 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         
-        const logs = await searchLogs(query, lastMinutes, maxLines);
+        const logs = await searchLogs(query, lastMinutes, maxLines, useRegex);
         return {
           content: [{ type: "text", text: logs }],
+        };
+      }
+      
+      case "get_logs_by_level": {
+        const level = args?.level as LogLevel;
+        const process = args?.process as string | undefined;
+        const lastMinutes = (args?.lastMinutes as number) || 5;
+        const maxLines = (args?.maxLines as number) || 200;
+        
+        if (!level) {
+          return {
+            content: [{ type: "text", text: "Error: level is required (fault, error, warning, info, debug)" }],
+          };
+        }
+        
+        const logs = await getLogsByLevel(level, process, lastMinutes, maxLines);
+        return {
+          content: [{ type: "text", text: `🔍 ${level.toUpperCase()} logs:\n\n${logs}` }],
+        };
+      }
+      
+      case "get_crash_logs": {
+        const process = args?.process as string | undefined;
+        const lastDays = (args?.lastDays as number) || 7;
+        const maxReports = (args?.maxReports as number) || 10;
+        
+        const { summary } = await getCrashLogs(process, lastDays, maxReports);
+        return {
+          content: [{ type: "text", text: summary }],
+        };
+      }
+      
+      case "read_crash_report": {
+        const filename = args?.filename as string;
+        
+        if (!filename) {
+          return {
+            content: [{ type: "text", text: "Error: filename is required. Use get_crash_logs first to find crash reports." }],
+          };
+        }
+        
+        const content = await readCrashReport(filename);
+        return {
+          content: [{ type: "text", text: `📄 Crash Report: ${filename}\n\n${content}` }],
+        };
+      }
+      
+      case "watch_for_pattern": {
+        const pattern = args?.pattern as string;
+        const useRegex = args?.useRegex as boolean || false;
+        const process = args?.process as string | undefined;
+        const timeoutSeconds = Math.min((args?.timeoutSeconds as number) || 30, 60);
+        
+        if (!pattern) {
+          return {
+            content: [{ type: "text", text: "Error: pattern is required" }],
+          };
+        }
+        
+        const result = await watchForPattern(pattern, useRegex, process, timeoutSeconds);
+        
+        if (result.found) {
+          return {
+            content: [{ 
+              type: "text", 
+              text: `✅ Pattern found!\n\n🎯 Matched line:\n${result.matchedLine}\n\n📝 Full log output:\n${result.allOutput}` 
+            }],
+          };
+        } else {
+          return {
+            content: [{ 
+              type: "text", 
+              text: `❌ Pattern "${pattern}" not found within ${timeoutSeconds} seconds.\n\n📝 Captured logs:\n${result.allOutput}` 
+            }],
+          };
+        }
+      }
+      
+      case "export_logs": {
+        const logs = args?.logs as string;
+        const filename = args?.filename as string | undefined;
+        const format = (args?.format as "txt" | "json") || "txt";
+        
+        if (!logs) {
+          return {
+            content: [{ type: "text", text: "Error: logs content is required" }],
+          };
+        }
+        
+        const filePath = await exportLogs(logs, filename, format);
+        return {
+          content: [{ type: "text", text: `✅ Logs exported to:\n${filePath}` }],
         };
       }
       
